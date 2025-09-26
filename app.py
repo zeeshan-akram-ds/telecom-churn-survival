@@ -6,11 +6,9 @@ import joblib
 import json
 import matplotlib.pyplot as plt
 from pathlib import Path
-import shap  # ensure installed: pip install shap
+import shap 
 
-# ------------------------
 # Config / paths
-# ------------------------
 MODEL_PATH = Path("models/final_gbsa_model.pkl")
 FEATURES_JSON = Path("models/model_features.json")
 PLOTS_DIR = Path("plots")
@@ -21,9 +19,7 @@ GROUP_SURVIVAL_PLOT = PLOTS_DIR / "gbsa_group_survival_curves.png"
 st.set_page_config(page_title="Churn Survival — GBSA", layout="wide")
 st.title("Customer Lifetime & Churn Risk — Production GBSA")
 
-# ------------------------
 # Utilities
-# ------------------------
 @st.cache_resource(show_spinner=False)
 def load_model(path: Path):
     if not path.exists():
@@ -83,9 +79,7 @@ def plot_survival(surv_funcs, title="Predicted Survival Curve"):
     st.pyplot(fig)
     plt.close(fig)
 
-# ------------------------
 # Load artifacts
-# ------------------------
 try:
     gbsa = load_model(MODEL_PATH)
     model_features = load_features(FEATURES_JSON)
@@ -93,9 +87,7 @@ except Exception as e:
     st.error(f"Startup error: {e}")
     st.stop()
 
-# ------------------------
 # Input form
-# ------------------------
 st.header("Enter Customer Profile")
 
 col1, col2 = st.columns([1, 1])
@@ -136,9 +128,7 @@ with col2:
 num_security = sum([1 for v in (sec_online_security, sec_online_backup, sec_device_protection, sec_tech_support) if v == "Yes"])
 num_streaming = sum([1 for v in (stream_tv, stream_movies) if v == "Yes"])
 
-# ------------------------
 # Prediction
-# ------------------------
 if st.button("Predict survival & risk", type="primary"):
     inputs = {
         "duration": float(duration),
@@ -204,18 +194,24 @@ if st.button("Predict survival & risk", type="primary"):
         try:
             explainer = shap.KernelExplainer(gbsa.predict, pd.DataFrame(np.zeros((1, X_row.shape[1])), columns=X_row.columns))
             shap_values = explainer.shap_values(X_row, nsamples=100)
-            fig = shap.waterfall_plot(shap.Explanation(values=shap_values[0], base_values=explainer.expected_value, data=X_row.iloc[0].values, feature_names=X_row.columns), max_display=10, show=False)
-            st.pyplot(bbox_inches="tight", dpi=300)
-            plt.clf()
+            exp = shap.Explanation(
+                values=shap_values[0],
+                base_values=explainer.expected_value,
+                data=X_row.iloc[0].values,
+                feature_names=X_row.columns
+            )
+            
+            fig, ax = plt.subplots(figsize=(8,6))
+            shap.waterfall_plot(exp, max_display=10, show=False)
+            st.pyplot(fig, bbox_inches="tight", dpi=300)
+            plt.close(fig)
         except Exception as se:
             st.info(f"SHAP explanation not available: {se}")
 
     except Exception as e:
         st.error(f"Prediction failed: {e}")
 
-# ------------------------
 # Static visuals
-# ------------------------
 st.markdown("---")
 st.header("Model Diagnostics (precomputed)")
 
@@ -223,14 +219,14 @@ cols = st.columns(3)
 with cols[0]:
     st.subheader("Permutation Importance")
     if PERMUTATION_PLOT.exists():
-        st.image(str(PERMUTATION_PLOT), use_column_width=True)
+        st.image(str(PERMUTATION_PLOT), use_container_width=True)
 
 with cols[1]:
     st.subheader("Sample Survival Curves")
     if SAMPLE_SURVIVAL_PLOT.exists():
-        st.image(str(SAMPLE_SURVIVAL_PLOT), use_column_width=True)
+        st.image(str(SAMPLE_SURVIVAL_PLOT), use_container_width=True)
 
 with cols[2]:
     st.subheader("High vs Low Risk Groups")
     if GROUP_SURVIVAL_PLOT.exists():
-        st.image(str(GROUP_SURVIVAL_PLOT), use_column_width=True)
+        st.image(str(GROUP_SURVIVAL_PLOT), use_container_width=True)
