@@ -1,0 +1,36 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.joblib
+
+# Environment
+.env
+*.venv
+.venv/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+data/*.csv
+data/*.xlsx
+data/*.parquet
+data/*.sav
+
+# Models (if too large, but keep if small enough)
+models/*.pkl
+
+# Logs
+*.log
+
+# Streamlit cache
+.streamlit/
