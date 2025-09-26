@@ -16,6 +16,7 @@ Key achievements:
 ---
 
 ## Repository Structure
+```
 ├── models/ # Trained survival models & feature JSON
 ├── data/ # Raw and cleaned telecom datasets
 ├── notebooks/ # Jupyter notebooks (EDA, feature engineering, modeling)
@@ -23,7 +24,7 @@ Key achievements:
 ├── app.py # Streamlit app for interactive churn prediction
 ├── requirements.txt
 └── README.md
-
+```
 ---
 
 ## Project Objectives
@@ -127,7 +128,12 @@ The **production Streamlit app** (`app.py`) enables:
 - **Diagnostic visuals**:  
   - Permutation Feature Importance  
   - Sample Predicted Survival Curves  
-  - Group Survival Curves (High vs Low Risk)  
+  - Group Survival Curves (High vs Low Risk)
+---
+## Live Demo
+Try the interactive app here: [Streamlit App](https://telecom-churn-survival-kdj4ca5aikobrbdeorqssv.streamlit.app/)
+
+*(Hosted on Streamlit Cloud — may take a few seconds to load on first run)*
 
 ### Example Screenshots
 
@@ -140,7 +146,7 @@ The **production Streamlit app** (`app.py`) enables:
 ## Installation & Usage
 ### Clone the repo
 ```bash
-git clone https://github.com/your-username/telecom-churn-survival.git
+git clone https://github.com/zeeshan-akram-ds/telecom-churn-survival.git
 cd telecom-churn-survival
 ```
 ### Install dependencies
