@@ -1,313 +1,286 @@
-# streamlit_app.py
-# Full Streamlit app for GBSA survival model prediction
-# - Loads model_features.json for the model's expected feature order
-# - Loads trained GBSA model from models/final_gbsa_model.pkl
-# - Builds a UI for user to input customer attributes (contract, internet, payment, binary flags,
-#   all 6 addon yes/no features to compute NumSecurityServices and NumStreamingServices,
-#   and the 5 synthetic features)
-# - Constructs a single-row DataFrame matching model_features and predicts:
-#     * risk score (higher = higher risk)
-#     * survival curve (plotted)
-#     * median predicted survival time
-#
-# Requirements:
-# pip install streamlit scikit-survival joblib pandas numpy matplotlib
-
+# app.py — Production-ready Streamlit app for GBSA churn-survival model
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
 import json
 import matplotlib.pyplot as plt
-from sksurv.util import Surv
+from pathlib import Path
 
-# ---------------------------
-# CONFIG: file paths (adjust if needed)
-# ---------------------------
-MODEL_PATH = "models/final_gbsa_model.pkl"
-FEATURES_JSON = "models/model_features.json"
+# Optional imports for SHAP (only used if available)
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except Exception:
+    SHAP_AVAILABLE = False
 
-# ---------------------------
-# Helper functions
-# ---------------------------
+# config / paths (adjust if needed)
+MODEL_PATH = Path("models/final_gbsa_model.pkl")
+FEATURES_JSON = Path("models/model_features.json")
+PLOTS_DIR = Path("plots")
+PERMUTATION_PLOT = PLOTS_DIR / "permutation_importance.png"
+SAMPLE_SURVIVAL_PLOT = PLOTS_DIR / "sample_survival_curves.png"
+GROUP_SURVIVAL_PLOT = PLOTS_DIR / "group_survival_curves.png"
+
+st.set_page_config(page_title="Churn Survival — GBSA", layout="wide")
+st.title("Customer Lifetime & Churn Risk — Production GBSA")
+
+# -------------------------
+# Utilities & loaders
+# -------------------------
 @st.cache_resource(show_spinner=False)
-def load_model(path):
-    model = joblib.load(path)
-    return model
+def load_model(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"Model file not found at {path}")
+    return joblib.load(path)
 
 @st.cache_data(show_spinner=False)
-def load_model_features(path):
+def load_features(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"Feature JSON not found at {path}")
     with open(path, "r") as f:
-        features = json.load(f)
-    # expect features to be list of strings
-    return features
+        feats = json.load(f)
+    return feats
 
 def build_input_row(features_list, inputs):
-    """
-    features_list: ordered list of model features (strings)
-    inputs: dict mapping logical variable names to values (not necessarily feature names)
-    Returns: pd.DataFrame single row with columns = features_list (in same order)
-    """
-    # initialize zeros
-    row = pd.Series(0, index=features_list, dtype=float)
+    """Return single-row DataFrame aligned to features_list (order preserved)."""
+    row = pd.Series(0.0, index=features_list, dtype=float)
 
-    # Binary features that are part of feature list (expected named exactly)
-    binary_map = {
-        "SeniorCitizen": inputs.get("SeniorCitizen", 0),
-        "Partner": inputs.get("Partner", 0),
-        "Dependents": inputs.get("Dependents", 0),
-        "PaperlessBilling": inputs.get("PaperlessBilling", 0),
-        "discount_received": inputs.get("discount_received", 0),
-        "no_complaint_flag": inputs.get("no_complaint_flag", 0),
-    }
-    for k,v in binary_map.items():
-        if k in row.index:
-            row[k] = float(v)
+    # binary flags
+    for k in ["SeniorCitizen","Partner","Dependents","PaperlessBilling","discount_received","no_complaint_flag"]:
+        if k in row.index and k in inputs:
+            row[k] = float(inputs[k])
 
-    # Numeric features
-    numeric_map = {
-        "duration": inputs.get("duration", 0.0),  # usually 1..72 (months)
-        "num_complaints": inputs.get("num_complaints", 0),
-        "last_complaint_days_ago": inputs.get("last_complaint_days_ago", 0.0),
-        "data_usage_gb": inputs.get("data_usage_gb", 0.0),
-        "late_payments_count": inputs.get("late_payments_count", 0),
-        "NumSecurityServices": inputs.get("NumSecurityServices", 0),
-        "NumStreamingServices": inputs.get("NumStreamingServices", 0),
-        # add MonthlyCharges or TotalCharges if model expects them (check features_list)
-    }
-    for k,v in numeric_map.items():
-        if k in row.index:
-            row[k] = float(v)
+    # numeric features
+    for k in ["duration","num_complaints","last_complaint_days_ago","data_usage_gb","late_payments_count","NumSecurityServices","NumStreamingServices"]:
+        if k in row.index and k in inputs:
+            row[k] = float(inputs[k])
 
-    # One-hot categorical features: we expect features list contains dummy column names like:
-    # 'InternetService_Fiber optic', 'InternetService_No', 'Contract_One year', 'Contract_Two year',
-    # 'PaymentMethod_Credit card (automatic)', 'PaymentMethod_Electronic check', 'PaymentMethod_Mailed check'
-    # The reference categories are dropped (e.g., DSL, Month-to-month, Bank transfer)
-    # So set the appropriate dummy column to 1 if present.
-    # inputs provides categorical choices as strings.
-    cat_map = {
-        "InternetService": inputs.get("InternetService", None),
-        "Contract": inputs.get("Contract", None),
-        "PaymentMethod": inputs.get("PaymentMethod", None)
-    }
+    # categorical one-hot handling (Contract, InternetService, PaymentMethod)
+    # Contract: Month-to-month (ref), One year, Two year
+    contract = inputs.get("Contract")
+    if contract == "One year" and "Contract_One year" in row.index:
+        row["Contract_One year"] = 1.0
+    elif contract == "Two year" and "Contract_Two year" in row.index:
+        row["Contract_Two year"] = 1.0
 
-    # Contract
-    contract_val = cat_map["Contract"]
-    if contract_val is not None:
-        # expected dummy names
-        if contract_val == "One year":
-            name = "Contract_One year"
-            if name in row.index: row[name] = 1.0
-        elif contract_val == "Two year":
-            name = "Contract_Two year"
-            if name in row.index: row[name] = 1.0
-        # Month-to-month is reference -> nothing to set
+    # InternetService: DSL (ref), Fiber optic, No
+    ist = inputs.get("InternetService")
+    if ist == "Fiber optic" and "InternetService_Fiber optic" in row.index:
+        row["InternetService_Fiber optic"] = 1.0
+    elif ist == "No" and "InternetService_No" in row.index:
+        row["InternetService_No"] = 1.0
 
-    # InternetService
-    ist = cat_map["InternetService"]
-    if ist is not None:
-        if ist == "Fiber optic":
-            name = "InternetService_Fiber optic"
-            if name in row.index: row[name] = 1.0
-        elif ist == "No":
-            name = "InternetService_No"
-            if name in row.index: row[name] = 1.0
-        # DSL was reference -> nothing to set
+    # PaymentMethod: Bank transfer (ref), Credit card (automatic), Electronic check, Mailed check
+    pm = inputs.get("PaymentMethod")
+    if pm == "Credit card (automatic)" and "PaymentMethod_Credit card (automatic)" in row.index:
+        row["PaymentMethod_Credit card (automatic)"] = 1.0
+    elif pm == "Electronic check" and "PaymentMethod_Electronic check" in row.index:
+        row["PaymentMethod_Electronic check"] = 1.0
+    elif pm == "Mailed check" and "PaymentMethod_Mailed check" in row.index:
+        row["PaymentMethod_Mailed check"] = 1.0
 
-    # PaymentMethod
-    pm = cat_map["PaymentMethod"]
-    if pm is not None:
-        if pm == "Credit card (automatic)":
-            name = "PaymentMethod_Credit card (automatic)"
-            if name in row.index: row[name] = 1.0
-        elif pm == "Electronic check":
-            name = "PaymentMethod_Electronic check"
-            if name in row.index: row[name] = 1.0
-        elif pm == "Mailed check":
-            name = "PaymentMethod_Mailed check"
-            if name in row.index: row[name] = 1.0
-        # Bank transfer (automatic) was reference -> nothing to set
-
-    # Return as single-row DataFrame in the same column order
     return pd.DataFrame([row.values], columns=row.index)
 
-def plot_survival_functions(surv_funcs, title="Predicted Survival Curve"):
-    plt.figure(figsize=(8,5))
+def plot_survival_functions_matplotlib(surv_funcs, title="Predicted Survival Curve"):
+    fig, ax = plt.subplots(figsize=(8,4.5))
     for fn in surv_funcs:
-        # fn is a StepFunction-like object with .x and .y attributes (sk-surv)
         x = fn.x
         y = fn.y
-        plt.step(x, y, where="post", alpha=0.8)
-    plt.ylim(-0.02, 1.02)
-    plt.xlabel("Months since start")
-    plt.ylabel("Survival probability")
-    plt.title(title)
-    plt.grid(True)
-    st.pyplot(plt.gcf())
-    plt.clf()
+        ax.step(x, y, where="post", alpha=0.9)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("Months since start")
+    ax.set_ylabel("Survival probability")
+    ax.set_title(title)
+    ax.grid(True, linestyle=":", alpha=0.6)
+    st.pyplot(fig)
+    plt.close(fig)
 
-# ---------------------------
-# Load model & feature list
-# ---------------------------
-st.set_page_config(page_title="Churn Survival Predictor (GBSA)", layout="wide")
-st.title("Customer Survival & Churn Risk — GBSA (Production)")
-
-# Load artifacts
+# -------------------------
+# Load model and features (fail fast)
+# -------------------------
 try:
-    gbsa_model = load_model(MODEL_PATH)
+    gbsa = load_model(MODEL_PATH)
+    model_features = load_features(FEATURES_JSON)
 except Exception as e:
-    st.error(f"Could not load GBSA model from {MODEL_PATH}: {e}")
+    st.error(f"Startup error: {e}")
     st.stop()
 
-try:
-    model_features = load_model_features(FEATURES_JSON)
-except Exception as e:
-    st.error(f"Could not load feature list from {FEATURES_JSON}: {e}")
-    st.stop()
+# -------------------------
+# Main: Inputs on the main page (not sidebar)
+# -------------------------
+st.header("Enter Customer Profile")
+st.markdown("Fill the customer's attributes below and click **Predict**. I will show the predicted survival curve, risk score and actionable suggestions.")
 
-st.markdown("**Model loaded. Fill the customer fields in the sidebar and click Predict.**")
+# Layout: two columns for inputs and a right column for quick actions/plots
+col1, col2 = st.columns([1, 1])
 
-# ---------------------------
-# Sidebar inputs
-# ---------------------------
-st.sidebar.header("Customer Input")
+with col1:
+    st.subheader("Basic & Contract Info")
+    duration = st.number_input("Tenure (months)", min_value=0, max_value=240, value=12, step=1)
+    contract = st.selectbox("Contract", ["Month-to-month", "One year", "Two year"])
+    internet = st.selectbox("Internet Service", ["DSL", "Fiber optic", "No"])
+    payment = st.selectbox("Payment Method", ["Bank transfer (automatic)", "Credit card (automatic)", "Electronic check", "Mailed check"])
+    senior = st.checkbox("Senior Citizen", value=False)
+    partner = st.checkbox("Partner", value=False)
+    dependents = st.checkbox("Dependents", value=False)
+    paperless = st.checkbox("Paperless Billing", value=True)
 
-# Basic customer details / durations
-duration = st.sidebar.number_input("Tenure (months)", min_value=0, max_value=240, value=12, step=1)
-# event not needed (we predict), but we require duration as a covariate
+with col2:
+    st.subheader("Add-ons (will be summed)")
+    st.markdown("Select Yes for each add-on the customer has.")
+    sec_online_security = st.selectbox("Online Security", ["No","Yes"], index=0)
+    sec_online_backup = st.selectbox("Online Backup", ["No","Yes"], index=0)
+    sec_device_protection = st.selectbox("Device Protection", ["No","Yes"], index=0)
+    sec_tech_support = st.selectbox("Tech Support", ["No","Yes"], index=0)
+    stream_tv = st.selectbox("Streaming TV", ["No","Yes"], index=0)
+    stream_movies = st.selectbox("Streaming Movies", ["No","Yes"], index=0)
 
-# Contract & service & payment (original categorical)
-contract = st.sidebar.selectbox("Contract", ["Month-to-month", "One year", "Two year"])
-internet = st.sidebar.selectbox("Internet Service", ["DSL", "Fiber optic", "No"])
-payment = st.sidebar.selectbox("Payment Method", ["Bank transfer (automatic)", "Credit card (automatic)", "Electronic check", "Mailed check"])
+    # synthetic features
+    st.subheader("Behavioral Inputs")
+    num_complaints = st.number_input("Number of complaints", min_value=0, max_value=100, value=0, step=1)
+    if num_complaints == 0:
+        last_complaint_days_ago = 0.0
+        no_complaint_flag = 1
+    else:
+        last_complaint_days_ago = st.number_input("Days since last complaint", min_value=0.0, max_value=5000.0, value=90.0, step=1.0)
+        no_complaint_flag = 0
 
-# Binary flags
-senior = st.sidebar.checkbox("Senior Citizen", value=False)
-partner = st.sidebar.checkbox("Partner", value=False)
-dependents = st.sidebar.checkbox("Dependents", value=False)
-paperless = st.sidebar.checkbox("Paperless Billing", value=True)
+    data_usage_gb = st.number_input("Data usage (GB/month)", min_value=0.0, max_value=10000.0, value=20.0, step=0.1)
+    late_payments_count = st.number_input("Late payments count", min_value=0, max_value=100, value=0, step=1)
+    discount_received = st.checkbox("Discount received previously", value=False)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Add-on Services (Yes / No)")
-st.sidebar.markdown("Answer Yes/No for the following 6 add-ons. They will be summed into NumSecurityServices and NumStreamingServices.")
+# compute addon sums
+num_security = sum([1 for v in (sec_online_security, sec_online_backup, sec_device_protection, sec_tech_support) if v == "Yes"])
+num_streaming = sum([1 for v in (stream_tv, stream_movies) if v == "Yes"])
 
-# Define addon inputs: 4 security services + 2 streaming
-sec_online_security = st.sidebar.radio("Online Security?", ("No", "Yes"))
-sec_online_backup = st.sidebar.radio("Online Backup?", ("No", "Yes"))
-sec_device_protection = st.sidebar.radio("Device Protection?", ("No", "Yes"))
-sec_tech_support = st.sidebar.radio("Tech Support?", ("No", "Yes"))
-
-stream_tv = st.sidebar.radio("Streaming TV?", ("No", "Yes"))
-stream_movies = st.sidebar.radio("Streaming Movies?", ("No", "Yes"))
-
-# Compute NumSecurityServices and NumStreamingServices
-num_security = sum([1 if v == "Yes" else 0 for v in [sec_online_security, sec_online_backup, sec_device_protection, sec_tech_support]])
-num_streaming = sum([1 if v == "Yes" else 0 for v in [stream_tv, stream_movies]])
-
-# Synthetic features
-st.sidebar.markdown("---")
-st.sidebar.subheader("Behavioral Inputs (Synthetic features)")
-
-num_complaints = st.sidebar.number_input("Number of complaints", min_value=0, max_value=50, value=0, step=1)
-# if num_complaints==0, last_complaint_days_ago will be auto 0 and flag set
-if num_complaints == 0:
-    last_complaint_days_ago = 0.0
-else:
-    last_complaint_days_ago = st.sidebar.number_input("Days since last complaint", min_value=0.0, max_value=5000.0, value=90.0, step=1.0)
-
-data_usage_gb = st.sidebar.number_input("Data usage (GB/month)", min_value=0.0, max_value=10000.0, value=20.0, step=0.1)
-late_payments_count = st.sidebar.number_input("Late payments count", min_value=0, max_value=100, value=0, step=1)
-discount_received = st.sidebar.checkbox("Discount received previously", value=False)
-
-# auto-compute no_complaint_flag
-no_complaint_flag = 1 if num_complaints == 0 else 0
-
-# Sidebar CTA
-st.sidebar.markdown("---")
-if st.sidebar.button("Predict survival & risk"):
-    # Build inputs dict
-    inputs = {
-        "duration": float(duration),
-        "Contract": contract,
-        "InternetService": internet,
-        "PaymentMethod": payment,
-        "SeniorCitizen": 1 if senior else 0,
-        "Partner": 1 if partner else 0,
-        "Dependents": 1 if dependents else 0,
-        "PaperlessBilling": 1 if paperless else 0,
-        "NumSecurityServices": int(num_security),
-        "NumStreamingServices": int(num_streaming),
-        "num_complaints": int(num_complaints),
-        "last_complaint_days_ago": float(last_complaint_days_ago),
-        "data_usage_gb": float(data_usage_gb),
-        "late_payments_count": int(late_payments_count),
-        "discount_received": 1 if discount_received else 0,
-        "no_complaint_flag": int(no_complaint_flag)
-    }
-
-    # Build feature-row DataFrame in correct order
-    X_row = build_input_row(model_features, inputs)
-
-    st.write("### Input features (model order)")
-    st.dataframe(X_row.T.rename(columns={0: "value"}))
-
-    # Predict risk score and survival function
-    try:
-        # risk score: higher means higher predicted hazard (GBSA.predict returns risk score)
-        risk_score = gbsa_model.predict(X_row)[0]
-        st.write(f"**Risk score (higher = higher risk):** {risk_score:.4f}")
-
-        # survival function
-        surv_fns = gbsa_model.predict_survival_function(X_row)
-        # Plot survival function
-        st.write("#### Predicted survival curve")
-        plot_survival_functions(surv_fns, title="Predicted Survival Curve (GBSA)")
-
-        # approximate median survival: find time where survival <= 0.5
-        fn = surv_fns[0]
-        # fn.x (times), fn.y (survival probs)
-        times = fn.x
-        surv_probs = fn.y
-        # find first time where survival <= 0.5
-        if np.any(surv_probs <= 0.5):
-            median_idx = np.argmax(surv_probs <= 0.5)
-            median_time = times[median_idx]
-            st.write(f"**Predicted median survival (months):** {median_time:.1f}")
-        else:
-            st.write("**Predicted median survival (months):** > max modelled time")
-
-        # Provide short business suggestion based on simple heuristics
-        st.markdown("### Quick business suggestion")
-        suggestions = []
-        if num_complaints >= 1 and last_complaint_days_ago <= 90:
-            suggestions.append("- Customer had a recent complaint → prioritize retention call + service recovery.")
-        if data_usage_gb >= 40:
-            suggestions.append("- High data usage → offer premium service check or prioritized tech support.")
-        if late_payments_count >= 1:
-            suggestions.append("- Late payments detected → offer flexible billing or payment reminders.")
-        if discount_received:
-            suggestions.append("- Customer already received a discount; combine with service improvements rather than another pure discount.")
-        if inputs["Contract"] == "Month-to-month":
-            suggestions.append("- Consider targeted offer to convert to 1-year contract (bundle + discount).")
-        if len(suggestions) == 0:
-            suggestions.append("- No immediate red flags; consider standard retention monitoring.")
-
-        for s in suggestions:
-            st.write(s)
-
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-
-# ---------------------------
-# Footer: notes & instructions
-# ---------------------------
+# Predict button
 st.markdown("---")
-st.markdown(
-    """
-    **Notes:**  
-    - This app uses the production GBSA model saved at `models/final_gbsa_model.pkl`.  
-    - The app expects `model_features.json` to contain the exact feature column names (in order) used during training.  
-    - The input UI converts human-friendly inputs into the model's one-hot / numeric features (reference categories are left as zeros).  
-    - For batch scoring, prepare a CSV with the same columns as `model_features.json` and load / predict externally.
-    """
-)
+predict_col, info_col = st.columns([1,1])
+with predict_col:
+    if st.button("Predict survival & risk", type="primary"):
+        # build inputs dict
+        inputs = {
+            "duration": float(duration),
+            "Contract": contract,
+            "InternetService": internet,
+            "PaymentMethod": payment,
+            "SeniorCitizen": 1 if senior else 0,
+            "Partner": 1 if partner else 0,
+            "Dependents": 1 if dependents else 0,
+            "PaperlessBilling": 1 if paperless else 0,
+            "NumSecurityServices": int(num_security),
+            "NumStreamingServices": int(num_streaming),
+            "num_complaints": int(num_complaints),
+            "last_complaint_days_ago": float(last_complaint_days_ago),
+            "data_usage_gb": float(data_usage_gb),
+            "late_payments_count": int(late_payments_count),
+            "discount_received": 1 if discount_received else 0,
+            "no_complaint_flag": int(no_complaint_flag)
+        }
+
+        # build model input and predict
+        try:
+            X_row = build_input_row(model_features, inputs)
+
+            # Risk score (higher means higher risk) and survival function
+            risk_score = gbsa.predict(X_row)[0]
+            surv_fns = gbsa.predict_survival_function(X_row)
+
+            # median survival (approx)
+            fn = surv_fns[0]
+            times = fn.x
+            surv_probs = fn.y
+            median_time = None
+            if np.any(surv_probs <= 0.5):
+                median_idx = np.argmax(surv_probs <= 0.5)
+                median_time = times[median_idx]
+
+            # Display results in a tidy panel
+            st.success("Prediction complete")
+            st.markdown("### Model Output")
+            st.metric("Risk score (higher = higher risk)", f"{risk_score:.4f}")
+            if median_time is not None:
+                st.metric("Predicted median survival (months)", f"{median_time:.1f}")
+            else:
+                st.metric("Predicted median survival (months)", "> max modelled time")
+
+            st.markdown("#### Predicted survival curve")
+            plot_survival_functions_matplotlib(surv_fns, title="Predicted Survival Curve (GBSA)")
+
+            # Business suggestions (simple but practical heuristics)
+            st.markdown("#### Quick business suggestions")
+            suggs = []
+            if num_complaints >= 1 and last_complaint_days_ago <= 90:
+                suggs.append("Recent complaint: prioritize this customer for service recovery and a retention offer.")
+            if data_usage_gb >= 40:
+                suggs.append("High usage: offer premium troubleshooting / SLA benefits to reduce friction.")
+            if late_payments_count >= 1:
+                suggs.append("Late payments: offer flexible billing or personalized payment reminders.")
+            if discount_received:
+                suggs.append("Already discounted: combine technical support or loyalty benefits, not just another discount.")
+            if contract == "Month-to-month":
+                suggs.append("Short contract: propose a one-year bundle with incentives to increase tenure.")
+            if len(suggs) == 0:
+                suggs.append("No immediate flags: monitor through standard retention cadence.")
+
+            for s in suggs:
+                st.write("- " + s)
+
+            # Optional SHAP explainability (run only on demand)
+            with info_col:
+                st.markdown("#### Model explanation")
+                if SHAP_AVAILABLE:
+                    if st.button("Show SHAP explanation"):
+                        try:
+                            # Best-effort SHAP: use TreeExplainer if supported, else KernelExplainer fallback (slow)
+                            explainer = None
+                            try:
+                                explainer = shap.TreeExplainer(gbsa)
+                            except Exception:
+                                explainer = shap.Explainer(gbsa.predict, X_row)  # fallback
+                            shap_values = explainer(X_row)
+                            # Use shap.plots.bar or summary_plot
+                            st.set_option('deprecation.showPyplotGlobalUse', False)
+                            fig = shap.plots.bar(shap_values, show=False)
+                            st.pyplot(fig)
+                            plt.clf()
+                        except Exception as se:
+                            st.error(f"SHAP explanation failed: {se}")
+                else:
+                    st.info("SHAP not installed or not available in this environment. To enable, install `shap` and restart the app.")
+
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
+
+# -------------------------
+# Right column: Precomputed visualizations (static images from plots/)
+# -------------------------
+st.markdown("---")
+st.header("Model Diagnostics & Visuals (precomputed)")
+
+img_cols = st.columns(3)
+with img_cols[0]:
+    st.subheader("Permutation Importance (GBSA)")
+    if PERMUTATION_PLOT.exists():
+        st.image(str(PERMUTATION_PLOT), use_column_width=True)
+    else:
+        st.info("Permutation importance image not found.")
+
+with img_cols[1]:
+    st.subheader("Sample Predicted Survival Curves")
+    if SAMPLE_SURVIVAL_PLOT.exists():
+        st.image(str(SAMPLE_SURVIVAL_PLOT), use_column_width=True)
+    else:
+        st.info("Sample survival curves image not found.")
+
+with img_cols[2]:
+    st.subheader("Group Survival Curves (High vs Low Risk)")
+    if GROUP_SURVIVAL_PLOT.exists():
+        st.image(str(GROUP_SURVIVAL_PLOT), use_column_width=True)
+    else:
+        st.info("Group survival curves image not found.")
+
+# Footer
+st.markdown("---")
+st.markdown("**Notes:** This app predicts customer survival curves and risk scores using a production GBSA model. Use the Business Suggestions as immediate tactics; for large-scale scoring, run batch predictions using the saved model and the same feature engineering pipeline.")
